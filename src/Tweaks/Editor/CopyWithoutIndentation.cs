@@ -1,4 +1,4 @@
-﻿using System;
+﻿using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Linq;
 using System.Text;
@@ -20,15 +20,21 @@ namespace Tweakster.Tweaks.Editor
     {
         public string DisplayName => nameof(CopyWithoutIndentation);
 
+        [Import]
+        private IRtfBuilderService _rtfService { get; set; }
+
         public bool ExecuteCommand(CopyCommandArgs args, CommandExecutionContext executionContext)
         {
             ITextSelection selection = args.TextView.Selection;
 
-            // Only handle single selections
-            if (selection.SelectedSpans.Count < 1 || !Options.Instance.CopyWithoutIndentation)
+            if (selection.SelectedSpans.Count != 1 // Only handle single selections
+                || selection.Start.Position == selection.End.Position // Don't handle zero-width selections
+                || !Options.Instance.CopyWithoutIndentation)
             {
                 return false;
             }
+
+            ITextSnapshot snapshot = args.TextView.TextBuffer.CurrentSnapshot;
 
             // Only handle selections that starts with indented
             if (args.TextView.TryGetTextViewLineContainingBufferPosition(selection.Start.Position, out ITextViewLine viewLine))
@@ -39,42 +45,46 @@ namespace Tweakster.Tweaks.Editor
                 }
             }
 
-            var selectionText = args.SubjectBuffer.CurrentSnapshot.GetText(selection.SelectedSpans[0]);
-            var lines = selectionText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            IEnumerable<ITextViewLine> lines = from line in args.TextView.TextViewLines
+                                               where line.IntersectsBufferSpan(selection.SelectedSpans[0])
+                                               select line;
 
-            // Only handle multi-line selections
-            if (lines.Length == 0)
+            // Only handle when multiple lines are selected
+            if (lines.Count() == 1)
             {
                 return false;
             }
 
             SnapshotPoint indentation = selection.Start.Position - viewLine.Start.Position;
-
+            var spans = new List<SnapshotSpan>();
             var sb = new StringBuilder();
-            sb.AppendLine(lines[0]);
 
-            foreach (var line in lines.Skip(1))
+            foreach (ITextViewLine line in lines)
             {
-                if (line.Length > indentation)
+                if (line.Extent.IsEmpty)
                 {
-                    var indentText = line.Substring(0, indentation);
-
-                    // Abort if subsequent lines aren't indented as much as the first line
-                    if (!string.IsNullOrWhiteSpace(indentText))
-                    {
-                        return false;
-                    }
-
-                    sb.AppendLine(line.Substring(indentation));
+                    spans.Add(line.Extent);
+                    sb.AppendLine();
                 }
                 else
                 {
-                    sb.AppendLine(line);
+                    var end = line.Length - indentation;
+                    if (selection.End.Position.Position < line.End.Position)
+                    {
+                        end -= (line.End.Position - selection.End.Position.Position);
+                    }
+
+                    var span = new SnapshotSpan(snapshot, line.Start + indentation, end);
+                    spans.Add(span);
+                    sb.AppendLine(span.GetText());
                 }
             }
 
+            var rtf = _rtfService.GenerateRtf(new NormalizedSnapshotSpanCollection(spans), args.TextView);
+
             var data = new DataObject();
-            data.SetText(sb.ToString().TrimEnd());
+            data.SetText(rtf.TrimEnd(), TextDataFormat.Rtf);
+            data.SetText(sb.ToString().TrimEnd(), TextDataFormat.Text);
             Clipboard.SetDataObject(data, false);
 
             return true;
